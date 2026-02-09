@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tarkov Ballistics Calculator (Local)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; line-height: 1.25; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; max-width: 1100px; }
+    label { display:block; font-size: 12px; opacity: .8; margin-bottom: 4px; }
+    input, select, button { padding: 8px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; }
+    input[type="number"] { width: 140px; }
+    input[type="text"] { width: 360px; }
+    button { cursor: pointer; }
+    .muted { opacity:.75; font-size: 12px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: right; }
+    th:first-child, td:first-child { text-align:left; }
+    .pill { display:inline-block; padding: 2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+    .error { color:#b00020; }
+    .ok { color:#0b6; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Tarkov Ballistics Calculator (Local)</h2>
+    <div class="muted">
+      Data source: tarkov.dev GraphQL API. Physics: gravity-only or tunable drag approximation.
+      (Tarkov simulates gravity + air friction; exact coefficients may differ by patch.) 
+    </div>
+
+    <hr style="border:none;border-top:1px solid #eee;margin:12px 0;" />
+
+    <div class="row">
+      <div>
+        <label>Ammo search (type to filter)</label>
+        <input id="ammoSearch" type="text" placeholder="e.g., 7.62x51mm M80" />
+        <div class="muted">Press “Load ammo list” first.</div>
+      </div>
+
+      <div>
+        <label>Selected ammo</label>
+        <select id="ammoSelect" style="width:420px;"></select>
+        <div class="muted mono" id="ammoMeta"></div>
+      </div>
+
+      <div style="align-self:flex-end;">
+        <button id="loadBtn">Load ammo list</button>
+        <div id="status" class="muted"></div>
+      </div>
+    </div>
+
+    <hr style="border:none;border-top:1px solid #eee;margin:12px 0;" />
+
+    <div class="row">
+      <div>
+        <label>Target range (m)</label>
+        <input id="rangeM" type="number" min="1" step="1" value="200" />
+      </div>
+
+      <div>
+        <label>Zero range (m)</label>
+        <input id="zeroM" type="number" min="1" step="1" value="100" />
+      </div>
+
+      <div>
+        <label>Sight height over bore (cm)</label>
+        <input id="sightCm" type="number" min="0" step="0.1" value="4.0" />
+      </div>
+
+      <div>
+        <label>Gravity (m/s²)</label>
+        <input id="g" type="number" step="0.01" value="9.81" />
+      </div>
+
+      <div>
+        <label>Model</label>
+        <select id="model">
+          <option value="simple">Simple (no drag)</option>
+          <option value="drag">Approx drag (tunable)</option>
+        </select>
+        <div class="muted">Use drag model + calibration for closer in-game match.</div>
+      </div>
+
+      <div>
+        <label>Drag factor (1/m)</label>
+        <input id="dragK" type="number" step="0.000001" value="0.0009" />
+        <div class="muted">Higher = more slow-down & drop.</div>
+      </div>
+
+      <div style="align-self:flex-end;">
+        <button id="calcBtn">Calculate</button>
+      </div>
+    </div>
+
+    <div id="out" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <h3 style="margin:0 0 8px 0;">Drop table</h3>
+    <div class="muted">Computed relative to your line of sight (LoS) and zero setting.</div>
+    <div id="tableWrap" style="margin-top:10px;"></div>
+  </div>
+
+<script>
+(() => {
+  // --- GraphQL: tarkov.dev community API (free)
+  // Docs: https://tarkov.dev/api/  Playground: https://api.tarkov.dev/
+  const GQL_ENDPOINT = "https://api.tarkov.dev/graphql";
+
+  // We request ammo name + caliber + initialSpeed. Some ammo objects may not have initialSpeed; we filter those out.
+  const AMMO_QUERY = `
+    query AmmoList {
+      ammo {
+        id
+        name
+        caliber
+        initialSpeed
+      }
+    }
+  `;
+
+  const els = {
+    loadBtn: document.getElementById("loadBtn"),
+    status: document.getElementById("status"),
+    ammoSearch: document.getElementById("ammoSearch"),
+    ammoSelect: document.getElementById("ammoSelect"),
+    ammoMeta: document.getElementById("ammoMeta"),
+    rangeM: document.getElementById("rangeM"),
+    zeroM: document.getElementById("zeroM"),
+    sightCm: document.getElementById("sightCm"),
+    g: document.getElementById("g"),
+    model: document.getElementById("model"),
+    dragK: document.getElementById("dragK"),
+    calcBtn: document.getElementById("calcBtn"),
+    out: document.getElementById("out"),
+    tableWrap: document.getElementById("tableWrap"),
+  };
+
+  /** @type {{id:string,name:string,caliber:string,initialSpeed:number}[]} */
+  let ammoAll = [];
+  /** filtered list currently shown */
+  let ammoShown = [];
+
+  function setStatus(msg, kind="muted") {
+    els.status.className = kind === "error" ? "muted error" : (kind==="ok" ? "muted ok" : "muted");
+    els.status.textContent = msg;
+  }
+
+  function fmt(n, d=2) {
+    if (!Number.isFinite(n)) return "—";
+    return n.toFixed(d);
+  }
+
+  function radToMoa(rad) { return rad * (180/Math.PI) * 60; }
+  function radToMrad(rad) { return rad * 1000; }
+
+  function buildSelect(list) {
+    els.ammoSelect.innerHTML = "";
+    for (const a of list) {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = `${a.name}  [${a.caliber}]`;
+      els.ammoSelect.appendChild(opt);
+    }
+    if (list.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No results";
+      els.ammoSelect.appendChild(opt);
+    }
+    updateAmmoMeta();
+  }
+
+  function updateAmmoMeta() {
+    const id = els.ammoSelect.value;
+    const a = ammoShown.find(x => x.id === id) || ammoAll.find(x => x.id === id);
+    if (!a) { els.ammoMeta.textContent = ""; return; }
+    els.ammoMeta.textContent = `muzzle v0 = ${fmt(a.initialSpeed,0)} m/s`;
+  }
+
+  async function loadAmmo() {
+    setStatus("Loading ammo list…");
+    els.loadBtn.disabled = true;
+    try {
+      const res = await fetch(GQL_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: AMMO_QUERY })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const raw = json?.data?.ammo || [];
+      ammoAll = raw
+        .filter(a => a && a.initialSpeed && a.name && a.caliber)
+        .map(a => ({ id: a.id, name: a.name, caliber: a.caliber, initialSpeed: Number(a.initialSpeed) }))
+        .sort((x,y) => x.name.localeCompare(y.name));
+
+      ammoShown = ammoAll.slice();
+      buildSelect(ammoShown);
+
+      setStatus(`Loaded ${ammoAll.length} ammo types.`, "ok");
+    } catch (e) {
+      console.error(e);
+      setStatus(`Failed to load ammo: ${e.message}`, "error");
+    } finally {
+      els.loadBtn.disabled = false;
+    }
+  }
+
+  function filterAmmo() {
+    const q = els.ammoSearch.value.trim().toLowerCase();
+    ammoShown = !q ? ammoAll.slice() : ammoAll.filter(a =>
+      a.name.toLowerCase().includes(q) || a.caliber.toLowerCase().includes(q)
+    );
+    buildSelect(ammoShown);
+  }
+
+  // --- Ballistics core (2D, no wind, flat fire)
+  // We compute the muzzle "launch angle" that makes the projectile intersect LoS at zero range, given sight height.
+  // LoS is treated as a straight line starting at (x=0, y=sightHeight) and running horizontally (y constant).
+  // Bore line starts at y=0. Launch angle is relative to horizontal.
+  //
+  // SIMPLE model (no drag):
+  //   y(x) = x*tan(a) - g*x^2/(2*v0^2*cos^2(a))
+  //
+  // DRAG model (approx):
+  //   dv/dt = -k * v^2  (k in 1/m)  -> speed decays roughly like v(t)=v0/(1+k*v0*t)
+  //   integrate numerically: x,y,vx,vy with gravity and quadratic drag.
+  //
+  // Output is "drop relative to LoS" at target range: drop = (y_los - y_bullet).
+  // Positive drop => bullet is below LoS => hold over.
+
+  function solveLaunchAngleNoDrag(v0, g, zeroX, sightY) {
+    // Find angle a such that y(zeroX) == sightY
+    // Use numeric solve (bisection) for robustness.
+    const f = (a) => {
+      const ca = Math.cos(a);
+      const ta = Math.tan(a);
+      const y = zeroX*ta - (g*zeroX*zeroX)/(2*v0*v0*ca*ca);
+      return y - sightY;
+    };
+    let lo = -0.05, hi = 0.15; // ~ -2.8° to +8.6°
+    let flo = f(lo), fhi = f(hi);
+
+    // Expand if needed
+    for (let i=0; i<30 && flo*fhi > 0; i++) {
+      lo -= 0.05; hi += 0.05;
+      flo = f(lo); fhi = f(hi);
+    }
+    if (flo*fhi > 0) return 0.0; // fallback
+
+    for (let i=0; i<80; i++) {
+      const mid = (lo+hi)/2;
+      const fmid = f(mid);
+      if (Math.abs(fmid) < 1e-8) return mid;
+      if (flo*fmid <= 0) { hi = mid; fhi = fmid; }
+      else { lo = mid; flo = fmid; }
+    }
+    return (lo+hi)/2;
+  }
+
+  function simulateNoDrag(v0, g, angle, targetX) {
+    const ca = Math.cos(angle), sa = Math.sin(angle);
+    const vx = v0*ca;
+    const t = targetX / vx;
+    const x = targetX;
+    const y = v0*sa*t - 0.5*g*t*t;
+    const vy = v0*sa - g*t;
+    const speed = Math.hypot(vx, vy);
+    return { t, x, y, vx, vy, speed };
+  }
+
+  function simulateWithDrag(v0, g, k, angle, targetX) {
+    // Semi-implicit Euler with small dt; stop when x >= targetX.
+    let x = 0, y = 0;
+    let vx = v0*Math.cos(angle);
+    let vy = v0*Math.sin(angle);
+    let t = 0;
+
+    const dt = 0.0015; // seconds
+    const maxT = 5.0;  // enough for most EFT ranges; extend if needed
+    for (let i=0; i<Math.floor(maxT/dt); i++) {
+      const v = Math.hypot(vx, vy);
+      // Quadratic drag: a_drag = -k * v * v_vec  (k in 1/m roughly)
+      const ax = -k * v * vx;
+      const ay = -k * v * vy - g;
+
+      // Update velocity then position
+      vx += ax * dt;
+      vy += ay * dt;
+
+      x += vx * dt;
+      y += vy * dt;
+      t += dt;
+
+      if (x >= targetX) break;
+      if (vx <= 0) break;
+    }
+    const speed = Math.hypot(vx, vy);
+    return { t, x, y, vx, vy, speed };
+  }
+
+  function solveLaunchAngleWithDrag(v0, g, k, zeroX, sightY) {
+    // Bisection on angle so that bullet y(zeroX) == sightY
+    const f = (a) => simulateWithDrag(v0, g, k, a, zeroX).y - sightY;
+    let lo = -0.05, hi = 0.18;
+    let flo = f(lo), fhi = f(hi);
+
+    for (let i=0; i<35 && flo*fhi > 0; i++) {
+      lo -= 0.05; hi += 0.05;
+      flo = f(lo); fhi = f(hi);
+    }
+    if (flo*fhi > 0) return 0.0;
+
+    for (let i=0; i<70; i++) {
+      const mid = (lo+hi)/2;
+      const fmid = f(mid);
+      if (Math.abs(fmid) < 1e-5) return mid;
+      if (flo*fmid <= 0) { hi = mid; fhi = fmid; }
+      else { lo = mid; flo = fmid; }
+    }
+    return (lo+hi)/2;
+  }
+
+  function computeAtRange(v0, g, sightY, zeroX, targetX, model, k) {
+    let angle = 0;
+    let sim;
+
+    if (model === "simple") {
+      angle = solveLaunchAngleNoDrag(v0, g, zeroX, sightY);
+      sim = simulateNoDrag(v0, g, angle, targetX);
+    } else {
+      angle = solveLaunchAngleWithDrag(v0, g, k, zeroX, sightY);
+      sim = simulateWithDrag(v0, g, k, angle, targetX);
+    }
+
+    const yLos = sightY; // horizontal LoS
+    const yBullet = sim.y;
+    const drop = yLos - yBullet; // meters; positive means below LoS
+
+    // Hold angle (small angle) ~ drop / range
+    const holdRad = drop / targetX;
+
+    return {
+      angleRad: angle,
+      timeS: sim.t,
+      dropM: drop,
+      holdRad,
+      holdMrad: radToMrad(holdRad),
+      holdMoa: radToMoa(holdRad),
+      impactY: yBullet,
+      speed: sim.speed
+    };
+  }
+
+  function calc() {
+    const id = els.ammoSelect.value;
+    const ammo = ammoAll.find(x => x.id === id) || ammoShown.find(x => x.id === id);
+    if (!ammo) {
+      els.out.innerHTML = `<div class="error">Select ammo first.</div>`;
+      return;
+    }
+
+    const targetX = Number(els.rangeM.value);
+    const zeroX = Number(els.zeroM.value);
+    const sightY = Number(els.sightCm.value) / 100.0;
+    const g = Number(els.g.value);
+    const model = els.model.value;
+    const k = Number(els.dragK.value);
+
+    if (!(targetX > 0 && zeroX > 0 && g > 0)) {
+      els.out.innerHTML = `<div class="error">Ranges and gravity must be > 0.</div>`;
+      return;
+    }
+
+    const v0 = ammo.initialSpeed;
+
+    const r = computeAtRange(v0, g, sightY, zeroX, targetX, model, k);
+
+    const clicks01mrad = r.holdMrad / 0.1;
+    const clicks025moa = r.holdMoa / 0.25;
+
+    els.out.innerHTML = `
+      <div class="row" style="align-items:flex-start;">
+        <div style="min-width:320px;">
+          <div><span class="pill">Ammo</span> <b>${ammo.name}</b> <span class="muted">[${ammo.caliber}]</span></div>
+          <div class="muted mono">v0=${fmt(v0,0)} m/s • model=${model}${model==="drag" ? ` (k=${k})` : ""}</div>
+        </div>
+        <div style="min-width:260px;">
+          <div><span class="pill">Result @ ${targetX}m</span></div>
+          <div>Time of flight: <b>${fmt(r.timeS,3)} s</b></div>
+          <div>Impact speed: <b>${fmt(r.speed,1)} m/s</b></div>
+        </div>
+        <div style="min-width:320px;">
+          <div><span class="pill">Holdover</span></div>
+          <div>Drop vs LoS: <b>${fmt(r.dropM*100,1)} cm</b></div>
+          <div>Hold: <b>${fmt(r.holdMrad,2)} mrad</b> / <b>${fmt(r.holdMoa,2)} MOA</b></div>
+          <div class="muted">Clicks: ${fmt(clicks01mrad,1)} @0.1 mrad • ${fmt(clicks025moa,1)} @0.25 MOA</div>
+        </div>
+      </div>
+    `;
+
+    // Table every 50m up to max(target, zero, 500) bounded.
+    const maxX = Math.min(Math.max(targetX, zeroX, 500), 1200);
+    const step = 50;
+
+    let html = `<table>
+      <thead>
+        <tr>
+          <th>Range (m)</th>
+          <th>Drop (cm)</th>
+          <th>Hold (mrad)</th>
+          <th>Hold (MOA)</th>
+          <th>TOF (s)</th>
+          <th>Speed (m/s)</th>
+        </tr>
+      </thead>
+      <tbody>
+    `;
+
+    for (let x=step; x<=maxX; x+=step) {
+      const rr = computeAtRange(v0, g, sightY, zeroX, x, model, k);
+      html += `<tr>
+        <td style="text-align:left;">${x}</td>
+        <td>${fmt(rr.dropM*100,1)}</td>
+        <td>${fmt(rr.holdMrad,2)}</td>
+        <td>${fmt(rr.holdMoa,2)}</td>
+        <td>${fmt(rr.timeS,3)}</td>
+        <td>${fmt(rr.speed,1)}</td>
+      </tr>`;
+    }
+
+    html += `</tbody></table>`;
+    els.tableWrap.innerHTML = html;
+  }
+
+  els.loadBtn.addEventListener("click", loadAmmo);
+  els.ammoSearch.addEventListener("input", filterAmmo);
+  els.ammoSelect.addEventListener("change", updateAmmoMeta);
+  els.calcBtn.addEventListener("click", calc);
+
+  // Small UX: if user changes model, show/hide drag input
+  function toggleDrag() {
+    const on = els.model.value === "drag";
+    els.dragK.disabled = !on;
+    els.dragK.style.opacity = on ? "1" : "0.5";
+  }
+  els.model.addEventListener("change", toggleDrag);
+  toggleDrag();
+
+  // preload empty select
+  buildSelect([]);
+})();
+</script>
+</body>
+</html>
