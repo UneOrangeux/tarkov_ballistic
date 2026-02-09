@@ -48,8 +48,70 @@
 
       <div style="align-self:flex-end;">
         <button id="loadBtn">Load ammo list</button>
+        <button id="forceRefreshBtn" style="margin-left:4px;" title="Clear cache and refetch">Force refresh</button>
         <div id="status" class="muted"></div>
+        <div id="cacheStatus" class="muted" style="margin-top:4px; font-size:11px;"></div>
       </div>
+    </div>
+
+    <hr style="border:none;border-top:1px solid #eee;margin:12px 0;" />
+
+    <div>
+      <h3 style="margin:0 0 8px 0;">Weapon build (optional)</h3>
+      <div class="muted">Select mods to compute effective muzzle velocity and sight height.</div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Weapon</label>
+        <select id="weaponSelect" style="width:320px;"></select>
+        <div class="muted mono" id="weaponMeta"></div>
+      </div>
+
+      <div>
+        <label>Barrel</label>
+        <select id="barrelSelect" style="width:320px;"></select>
+        <div class="muted mono" id="barrelMeta"></div>
+      </div>
+
+      <div>
+        <label>Muzzle device</label>
+        <select id="muzzleSelect" style="width:320px;"></select>
+        <div class="muted mono" id="muzzleMeta"></div>
+      </div>
+
+      <div>
+        <label>Optic / Sight</label>
+        <select id="opticSelect" style="width:320px;"></select>
+        <div class="muted mono" id="opticMeta"></div>
+      </div>
+
+      <div>
+        <label>Mount</label>
+        <select id="mountSelect" style="width:320px;"></select>
+        <div class="muted mono" id="mountMeta"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label style="display:flex; gap:6px; align-items:center;">
+          <input id="sightOverride" type="checkbox" style="width:auto; cursor:pointer;" />
+          Manual sight height override (cm)
+        </label>
+        <input id="sightManualCm" type="number" step="0.1" value="0" style="width:140px;" disabled/>
+        <div class="muted">When checked, use value above instead of computed.</div>
+      </div>
+
+      <div style="align-self:flex-end;">
+        <button id="loadItemsBtn">Load items</button>
+        <div id="itemsStatus" class="muted"></div>
+      </div>
+    </div>
+
+    <div id="buildSummary" style="margin-top:12px; padding:8px; background:#f9f9f9; border-radius:8px; display:none;">
+      <strong>Build summary:</strong>
+      <div id="buildSummaryText" class="muted mono"></div>
     </div>
 
     <hr style="border:none;border-top:1px solid #eee;margin:12px 0;" />
@@ -68,6 +130,7 @@
       <div>
         <label>Sight height over bore (cm)</label>
         <input id="sightCm" type="number" min="0" step="0.1" value="4.0" />
+        <div class="muted">Auto-computed from build or manual value.</div>
       </div>
 
       <div>
@@ -122,12 +185,126 @@
     }
   `;
 
+  // Query for weapons and mods (simplified for now; can be expanded)
+  const ITEMS_QUERY = `
+    query Items {
+      items(limit: 10000) {
+        id
+        name
+        normalizedName
+        properties {
+          __typename
+          ... on AmmoBoxProperties { initialSpeed }
+          ... on ArmorProperties { armorClass }
+          ... on BarrelProperties { ergonomicsModifier muzzleVelocityModifierPercent }
+          ... on CameraMountProperties { sightingRange }
+          ... on FaceshieldProperties { protectionZones }
+          ... on GripProperties { ergonomicsModifier }
+          ... on GunModuleProperties { ergonomicsModifier muzzleVelocityModifierPercent }
+          ... on MagazineProperties { capacity }
+          ... on MeleeProperties { damage }
+          ... on MuzzleModuleProperties { muzzleVelocityModifierPercent noiseSuppressor }
+          ... on NightVisionProperties { omitterColor }
+          ... on OpticScopeProperties { reticleType zoomLevels }
+          ... on PistolGripProperties { ergonomicsModifier }
+          ... on RangeFinderProperties { maxRange }
+          ... on ReceiverProperties { ergonomicsModifier }
+          ... on SightProperties { reticleType zoomLevel }
+          ... on SpecialLootProperties { specialLootName }
+          ... on StockProperties { ergonomicsModifier }
+          ... on VestProperties { gridsSize }
+          ... on WeaponProperties { ergonomicsModifier fireType fireRate }
+        }
+        categories {
+          name
+        }
+      }
+    }
+  `;
+
+  // ===== Cache Helpers =====
+  const CACHE_VERSION = "v1";
+  const CACHE_KEY_AMMO = `tarkov_ammo_${CACHE_VERSION}`;
+  const CACHE_KEY_ITEMS = `tarkov_items_${CACHE_VERSION}`;
+  const CACHE_TTL_HOURS = 24;
+
+  function getCached(key) {
+    try {
+      const stored = localStorage.getItem(key);
+      if (!stored) return null;
+      const { data, timestamp } = JSON.parse(stored);
+      const ageMs = Date.now() - timestamp;
+      const ttlMs = CACHE_TTL_HOURS * 60 * 60 * 1000;
+      if (ageMs > ttlMs) {
+        localStorage.removeItem(key);
+        return null;
+      }
+      return data;
+    } catch (e) {
+      console.warn("Cache read error:", e);
+      return null;
+    }
+  }
+
+  function setCached(key, data) {
+    try {
+      localStorage.setItem(key, JSON.stringify({ data, timestamp: Date.now() }));
+    } catch (e) {
+      console.warn("Cache write error:", e);
+    }
+  }
+
+  function clearCache(key) {
+    try {
+      localStorage.removeItem(key);
+    } catch (e) {
+      console.warn("Cache clear error:", e);
+    }
+  }
+
+  // ===== Preset tables for mounts/optics if API data missing =====
+  const SIGHT_HEIGHT_PRESETS = {
+    // Common mount heights (mm to cm)
+    "Picatinny": 2.0,
+    "Weaver": 1.8,
+    "LVPO": 2.4,
+    "Aimpoint": 2.6,
+    // Common optic heights (rough estimates in cm)
+    "PK-06": 1.5,
+    "Vudu": 2.0,
+    "Elcan": 2.2,
+    "HAMR": 2.1,
+    "default_optic": 2.0,
+    "default_mount": 2.0,
+  };
+
   const els = {
     loadBtn: document.getElementById("loadBtn"),
+    forceRefreshBtn: document.getElementById("forceRefreshBtn"),
     status: document.getElementById("status"),
+    cacheStatus: document.getElementById("cacheStatus"),
     ammoSearch: document.getElementById("ammoSearch"),
     ammoSelect: document.getElementById("ammoSelect"),
     ammoMeta: document.getElementById("ammoMeta"),
+    
+    weaponSelect: document.getElementById("weaponSelect"),
+    weaponMeta: document.getElementById("weaponMeta"),
+    barrelSelect: document.getElementById("barrelSelect"),
+    barrelMeta: document.getElementById("barrelMeta"),
+    muzzleSelect: document.getElementById("muzzleSelect"),
+    muzzleMeta: document.getElementById("muzzleMeta"),
+    opticSelect: document.getElementById("opticSelect"),
+    opticMeta: document.getElementById("opticMeta"),
+    mountSelect: document.getElementById("mountSelect"),
+    mountMeta: document.getElementById("mountMeta"),
+    
+    sightOverride: document.getElementById("sightOverride"),
+    sightManualCm: document.getElementById("sightManualCm"),
+    loadItemsBtn: document.getElementById("loadItemsBtn"),
+    itemsStatus: document.getElementById("itemsStatus"),
+    buildSummary: document.getElementById("buildSummary"),
+    buildSummaryText: document.getElementById("buildSummaryText"),
+    
     rangeM: document.getElementById("rangeM"),
     zeroM: document.getElementById("zeroM"),
     sightCm: document.getElementById("sightCm"),
@@ -143,10 +320,31 @@
   let ammoAll = [];
   /** filtered list currently shown */
   let ammoShown = [];
+  
+  /** @type {{id:string,name:string,normalizedName:string,categories:any[],properties:any}[]} */
+  let itemsAll = [];
+  
+  /** Current build selection */
+  let selectedBuild = {
+    weaponId: null,
+    barrelId: null,
+    muzzleId: null,
+    opticId: null,
+    mountId: null,
+  };
 
   function setStatus(msg, kind="muted") {
     els.status.className = kind === "error" ? "muted error" : (kind==="ok" ? "muted ok" : "muted");
     els.status.textContent = msg;
+  }
+
+  function setItemsStatus(msg, kind="muted") {
+    els.itemsStatus.className = kind === "error" ? "muted error" : (kind==="ok" ? "muted ok" : "muted");
+    els.itemsStatus.textContent = msg;
+  }
+
+  function setCacheStatus(msg) {
+    els.cacheStatus.textContent = msg;
   }
 
   function fmt(n, d=2) {
@@ -157,7 +355,113 @@
   function radToMoa(rad) { return rad * (180/Math.PI) * 60; }
   function radToMrad(rad) { return rad * 1000; }
 
-  function buildSelect(list) {
+  function buildSelect(list, selectEl) {
+    selectEl.innerHTML = "";
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "— None —";
+    selectEl.appendChild(opt);
+    
+    for (const a of list) {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = a.name;
+      selectEl.appendChild(opt);
+    }
+  }
+
+  function updateAmmoMeta() {
+    const id = els.ammoSelect.value;
+    const a = ammoShown.find(x => x.id === id) || ammoAll.find(x => x.id === id);
+    if (!a) { els.ammoMeta.textContent = ""; return; }
+    els.ammoMeta.textContent = `muzzle v0 = ${fmt(a.initialSpeed,0)} m/s`;
+  }
+
+  function updateModMeta(item, metaEl) {
+    if (!item) {
+      metaEl.textContent = "";
+      return;
+    }
+    const props = item.properties || {};
+    const lines = [];
+    if (props.muzzleVelocityModifierPercent !== undefined && props.muzzleVelocityModifierPercent !== null) {
+      lines.push(`MV mod: ${props.muzzleVelocityModifierPercent > 0 ? "+" : ""}${props.muzzleVelocityModifierPercent}%`);
+    }
+    if (props.ergonomicsModifier !== undefined && props.ergonomicsModifier !== null) {
+      lines.push(`Ergo: ${props.ergonomicsModifier > 0 ? "+" : ""}${props.ergonomicsModifier}`);
+    }
+    metaEl.textContent = lines.join(" • ") || "(no data)";
+  }
+
+  function getPropFloat(item, propName, def = null) {
+    const val = item?.properties?.[propName];
+    if (val === null || val === undefined) return def;
+    const num = Number(val);
+    return Number.isFinite(num) ? num : def;
+  }
+
+  function itemsByCategory(categoryName) {
+    return itemsAll.filter(item =>
+      item.categories && item.categories.some(c => c.name === categoryName)
+    );
+  }
+
+  async function loadAmmoCached() {
+    // Check cache first
+    const cached = getCached(CACHE_KEY_AMMO);
+    if (cached) {
+      ammoAll = cached;
+      ammoShown = ammoAll.slice();
+      buildSelectAmmo(ammoShown);
+      setCacheStatus("Loaded from cache (auto-refresh in background)");
+      setStatus(`Loaded ${ammoAll.length} ammo types (cached).`, "ok");
+      // Refresh in background
+      loadAmmoNet();
+      return;
+    }
+
+    // No cache, load from network
+    loadAmmoNet();
+  }
+
+  async function loadAmmoNet() {
+    try {
+      const res = await fetch(GQL_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: AMMO_QUERY })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json.errors) throw new Error(json.errors.map(e => e.message).join("; "));
+      
+      const raw = json?.data?.ammo || [];
+      ammoAll = raw
+        .filter(a => a && a.initialSpeed && a.name && a.caliber)
+        .map(a => ({ id: a.id, name: a.name, caliber: a.caliber, initialSpeed: Number(a.initialSpeed) }))
+        .sort((x,y) => x.name.localeCompare(y.name));
+
+      ammoShown = ammoAll.slice();
+      setCached(CACHE_KEY_AMMO, ammoAll);
+      buildSelectAmmo(ammoShown);
+      setCacheStatus("Online loaded.");
+      setStatus(`Loaded ${ammoAll.length} ammo types.`, "ok");
+    } catch (e) {
+      console.error(e);
+      const fallback = getCached(CACHE_KEY_AMMO);
+      if (fallback) {
+        ammoAll = fallback;
+        ammoShown = ammoAll.slice();
+        buildSelectAmmo(ammoShown);
+        setCacheStatus("Offline (using cached data)");
+        setStatus(`Network failed; using cached data: ${ammoAll.length} types.`, "ok");
+      } else {
+        setStatus(`Failed to load ammo: ${e.message}`, "error");
+      }
+    }
+  }
+
+  function buildSelectAmmo(list) {
     els.ammoSelect.innerHTML = "";
     for (const a of list) {
       const opt = document.createElement("option");
@@ -174,48 +478,192 @@
     updateAmmoMeta();
   }
 
-  function updateAmmoMeta() {
-    const id = els.ammoSelect.value;
-    const a = ammoShown.find(x => x.id === id) || ammoAll.find(x => x.id === id);
-    if (!a) { els.ammoMeta.textContent = ""; return; }
-    els.ammoMeta.textContent = `muzzle v0 = ${fmt(a.initialSpeed,0)} m/s`;
-  }
-
-  async function loadAmmo() {
-    setStatus("Loading ammo list…");
-    els.loadBtn.disabled = true;
-    try {
-      const res = await fetch(GQL_ENDPOINT, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: AMMO_QUERY })
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      const raw = json?.data?.ammo || [];
-      ammoAll = raw
-        .filter(a => a && a.initialSpeed && a.name && a.caliber)
-        .map(a => ({ id: a.id, name: a.name, caliber: a.caliber, initialSpeed: Number(a.initialSpeed) }))
-        .sort((x,y) => x.name.localeCompare(y.name));
-
-      ammoShown = ammoAll.slice();
-      buildSelect(ammoShown);
-
-      setStatus(`Loaded ${ammoAll.length} ammo types.`, "ok");
-    } catch (e) {
-      console.error(e);
-      setStatus(`Failed to load ammo: ${e.message}`, "error");
-    } finally {
-      els.loadBtn.disabled = false;
-    }
-  }
-
   function filterAmmo() {
     const q = els.ammoSearch.value.trim().toLowerCase();
     ammoShown = !q ? ammoAll.slice() : ammoAll.filter(a =>
       a.name.toLowerCase().includes(q) || a.caliber.toLowerCase().includes(q)
     );
-    buildSelect(ammoShown);
+    buildSelectAmmo(ammoShown);
+  }
+
+  async function loadItemsCached() {
+    const cached = getCached(CACHE_KEY_ITEMS);
+    if (cached) {
+      itemsAll = cached;
+      populateWeaponSelects();
+      setItemsStatus(`Loaded ${itemsAll.length} items (cached).`, "ok");
+      // Refresh in background
+      loadItemsNet();
+      return;
+    }
+    loadItemsNet();
+  }
+
+  async function loadItemsNet() {
+    setItemsStatus("Loading items…");
+    els.loadItemsBtn.disabled = true;
+    try {
+      const res = await fetch(GQL_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: ITEMS_QUERY })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json.errors) throw new Error(json.errors.map(e => e.message).join("; "));
+      
+      const raw = json?.data?.items || [];
+      itemsAll = raw
+        .filter(i => i && i.id && i.name)
+        .map(i => ({
+          id: i.id,
+          name: i.name,
+          normalizedName: i.normalizedName || "",
+          categories: i.categories || [],
+          properties: i.properties || {}
+        }));
+
+      setCached(CACHE_KEY_ITEMS, itemsAll);
+      populateWeaponSelects();
+      setItemsStatus(`Loaded ${itemsAll.length} items.`, "ok");
+    } catch (e) {
+      console.error(e);
+      const fallback = getCached(CACHE_KEY_ITEMS);
+      if (fallback) {
+        itemsAll = fallback;
+        populateWeaponSelects();
+        setItemsStatus(`Network failed; using cached ${itemsAll.length} items.`, "ok");
+      } else {
+        setItemsStatus(`Failed: ${e.message}`, "error");
+      }
+    } finally {
+      els.loadItemsBtn.disabled = false;
+    }
+  }
+
+  function populateWeaponSelects() {
+    const weapons = itemsByCategory("weapon");
+    const barrels = itemsByCategory("barrel");
+    const muzzles = itemsByCategory("muzzle");
+    const optics = itemsByCategory("optic") || itemsByCategory("sight");
+    const mounts = itemsByCategory("mount");
+
+    buildSelect(weapons, els.weaponSelect);
+    buildSelect(barrels, els.barrelSelect);
+    buildSelect(muzzles, els.muzzleSelect);
+    buildSelect([...optics], els.opticSelect);
+    buildSelect(mounts, els.mountSelect);
+  }
+
+  function updateBuildMeta() {
+    const buildMap = {
+      weaponId: { select: els.weaponSelect, meta: els.weaponMeta },
+      barrelId: { select: els.barrelSelect, meta: els.barrelMeta },
+      muzzleId: { select: els.muzzleSelect, meta: els.muzzleMeta },
+      opticId: { select: els.opticSelect, meta: els.opticMeta },
+      mountId: { select: els.mountSelect, meta: els.mountMeta },
+    };
+
+    Object.keys(buildMap).forEach(key => {
+      selectedBuild[key] = buildMap[key].select.value;
+      const item = itemsAll.find(i => i.id === buildMap[key].select.value);
+      updateModMeta(item, buildMap[key].meta);
+    });
+
+    updateBuildSummary();
+  }
+
+  function computeBuild() {
+    // Collect selected items
+    const weapon = itemsAll.find(i => i.id === selectedBuild.weaponId);
+    const barrel = itemsAll.find(i => i.id === selectedBuild.barrelId);
+    const muzzle = itemsAll.find(i => i.id === selectedBuild.muzzleId);
+    const optic = itemsAll.find(i => i.id === selectedBuild.opticId);
+    const mount = itemsAll.find(i => i.id === selectedBuild.mountId);
+
+    // Compute effective muzzle velocity
+    let v0Effective = null;
+    if (weapon) {
+      const baseV0 = weapon.properties?.muzzleVelocityModifierPercent;
+      let v0 = 100; // dummy base; get from ammo
+      if (Number.isFinite(baseV0)) v0 *= (1 + baseV0 / 100);
+      
+      let barrelMod = 0;
+      if (barrel && Number.isFinite(barrel.properties?.muzzleVelocityModifierPercent)) {
+        barrelMod = barrel.properties.muzzleVelocityModifierPercent;
+      }
+      let muzzleMod = 0;
+      if (muzzle && Number.isFinite(muzzle.properties?.muzzleVelocityModifierPercent)) {
+        muzzleMod = muzzle.properties.muzzleVelocityModifierPercent;
+      }
+
+      v0Effective = v0 * (1 + (barrelMod + muzzleMod) / 100);
+    }
+
+    // Compute effective sight height
+    let sightHeight = null;
+    if (mount || optic) {
+      let h = 0;
+      if (mount) h += getPropFloat(mount, "sightingRange", 0) / 10 || SIGHT_HEIGHT_PRESETS["default_mount"] || 2.0;
+      if (optic) h += getPropFloat(optic, "sightingRange", 0) / 10 || SIGHT_HEIGHT_PRESETS["default_optic"] || 2.0;
+      sightHeight = h;
+    }
+
+    return { v0Effective, sightHeight, weapon, barrel, muzzle, optic, mount };
+  }
+
+  function updateBuildSummary() {
+    const build = computeBuild();
+    if (!build.weapon && !build.barrel && !build.muzzle && !build.optic && !build.mount) {
+      els.buildSummary.style.display = "none";
+      return;
+    }
+
+    const parts = [];
+    if (build.weapon) parts.push(`Weapon: ${build.weapon.name}`);
+    if (build.barrel) parts.push(`Barrel: ${build.barrel.name}`);
+    if (build.muzzle) parts.push(`Muzzle: ${build.muzzle.name}`);
+    if (build.optic) parts.push(`Optic: ${build.optic.name}`);
+    if (build.mount) parts.push(`Mount: ${build.mount.name}`);
+
+    if (build.v0Effective) parts.push(`Effective MV: +${(build.v0Effective - 100).toFixed(1)}%`);
+    if (build.sightHeight !== null) parts.push(`Sight height: ${build.sightHeight.toFixed(1)} cm`);
+
+    els.buildSummaryText.textContent = parts.join(" \n ");
+    els.buildSummary.style.display = "block";
+
+    // Update sight height field if not overridden
+    if (build.sightHeight !== null && !els.sightOverride.checked) {
+      els.sightCm.value = build.sightHeight.toFixed(1);
+    }
+  }
+
+  function getEffectiveSightHeight() {
+    if (els.sightOverride.checked) {
+      return Number(els.sightManualCm.value) || 0;
+    }
+    return Number(els.sightCm.value) || 4.0;
+  }
+
+  function getEffectiveV0() {
+    const id = els.ammoSelect.value;
+    const ammo = ammoAll.find(x => x.id === id);
+    if (!ammo || !Number.isFinite(ammo.initialSpeed)) {
+      return null;
+    }
+
+    const build = computeBuild();
+    let v0 = ammo.initialSpeed;
+
+    // Apply modifiers if build selected
+    if (build.barrel && Number.isFinite(build.barrel.properties?.muzzleVelocityModifierPercent)) {
+      v0 *= (1 + build.barrel.properties.muzzleVelocityModifierPercent / 100);
+    }
+    if (build.muzzle && Number.isFinite(build.muzzle.properties?.muzzleVelocityModifierPercent)) {
+      v0 *= (1 + build.muzzle.properties.muzzleVelocityModifierPercent / 100);
+    }
+
+    return v0;
   }
 
   // --- Ballistics core (2D, no wind, flat fire)
@@ -234,6 +682,9 @@
   // Positive drop => bullet is below LoS => hold over.
 
   function solveLaunchAngleNoDrag(v0, g, zeroX, sightY) {
+    if (!Number.isFinite(v0) || !Number.isFinite(g) || !Number.isFinite(zeroX) || !Number.isFinite(sightY)) {
+      return NaN;
+    }
     // Find angle a such that y(zeroX) == sightY
     // Use numeric solve (bisection) for robustness.
     const f = (a) => {
@@ -250,7 +701,10 @@
       lo -= 0.05; hi += 0.05;
       flo = f(lo); fhi = f(hi);
     }
-    if (flo*fhi > 0) return 0.0; // fallback
+    if (flo*fhi > 0) {
+      console.warn("Bisection failed to bracket for noDrag");
+      return NaN;
+    }
 
     for (let i=0; i<80; i++) {
       const mid = (lo+hi)/2;
@@ -263,8 +717,14 @@
   }
 
   function simulateNoDrag(v0, g, angle, targetX) {
+    if (!Number.isFinite(v0) || !Number.isFinite(angle) || !Number.isFinite(targetX)) {
+      return { t: NaN, x: NaN, y: NaN, vx: NaN, vy: NaN, speed: NaN };
+    }
     const ca = Math.cos(angle), sa = Math.sin(angle);
     const vx = v0*ca;
+    if (vx <= 0) {
+      return { t: NaN, x: NaN, y: NaN, vx: NaN, vy: NaN, speed: NaN };
+    }
     const t = targetX / vx;
     const x = targetX;
     const y = v0*sa*t - 0.5*g*t*t;
@@ -274,6 +734,9 @@
   }
 
   function simulateWithDrag(v0, g, k, angle, targetX) {
+    if (!Number.isFinite(v0) || !Number.isFinite(k) || !Number.isFinite(angle) || !Number.isFinite(targetX)) {
+      return { t: NaN, x: NaN, y: NaN, vx: NaN, vy: NaN, speed: NaN };
+    }
     // Semi-implicit Euler with small dt; stop when x >= targetX.
     let x = 0, y = 0;
     let vx = v0*Math.cos(angle);
@@ -304,8 +767,14 @@
   }
 
   function solveLaunchAngleWithDrag(v0, g, k, zeroX, sightY) {
+    if (!Number.isFinite(v0) || !Number.isFinite(g) || !Number.isFinite(k) || !Number.isFinite(zeroX) || !Number.isFinite(sightY)) {
+      return NaN;
+    }
     // Bisection on angle so that bullet y(zeroX) == sightY
-    const f = (a) => simulateWithDrag(v0, g, k, a, zeroX).y - sightY;
+    const f = (a) => {
+      const sim = simulateWithDrag(v0, g, k, a, zeroX);
+      return sim.y - sightY;
+    };
     let lo = -0.05, hi = 0.18;
     let flo = f(lo), fhi = f(hi);
 
@@ -313,7 +782,10 @@
       lo -= 0.05; hi += 0.05;
       flo = f(lo); fhi = f(hi);
     }
-    if (flo*fhi > 0) return 0.0;
+    if (flo*fhi > 0) {
+      console.warn("Bisection failed to bracket for drag");
+      return NaN;
+    }
 
     for (let i=0; i<70; i++) {
       const mid = (lo+hi)/2;
@@ -326,7 +798,7 @@
   }
 
   function computeAtRange(v0, g, sightY, zeroX, targetX, model, k) {
-    let angle = 0;
+    let angle = NaN;
     let sim;
 
     if (model === "simple") {
@@ -366,7 +838,7 @@
 
     const targetX = Number(els.rangeM.value);
     const zeroX = Number(els.zeroM.value);
-    const sightY = Number(els.sightCm.value) / 100.0;
+    const sightY = getEffectiveSightHeight() / 100.0;
     const g = Number(els.g.value);
     const model = els.model.value;
     const k = Number(els.dragK.value);
@@ -376,9 +848,19 @@
       return;
     }
 
-    const v0 = ammo.initialSpeed;
+    // Use computed effective v0
+    const v0 = getEffectiveV0();
+    if (!Number.isFinite(v0)) {
+      els.out.innerHTML = `<div class="error">Invalid ammo or computation error.</div>`;
+      return;
+    }
 
     const r = computeAtRange(v0, g, sightY, zeroX, targetX, model, k);
+
+    if (!Number.isFinite(r.angleRad) || !Number.isFinite(r.dropM)) {
+      els.out.innerHTML = `<div class="error">Ballistic computation failed. Check inputs and try different parameters.</div>`;
+      return;
+    }
 
     const clicks01mrad = r.holdMrad / 0.1;
     const clicks025moa = r.holdMoa / 0.25;
@@ -437,9 +919,30 @@
     els.tableWrap.innerHTML = html;
   }
 
-  els.loadBtn.addEventListener("click", loadAmmo);
+  // Event listeners
+  els.loadBtn.addEventListener("click", loadAmmoCached);
+  els.forceRefreshBtn.addEventListener("click", () => {
+    clearCache(CACHE_KEY_AMMO);
+    clearCache(CACHE_KEY_ITEMS);
+    setCacheStatus("Cache cleared.");
+    loadAmmoCached();
+    loadItemsCached();
+  });
+
   els.ammoSearch.addEventListener("input", filterAmmo);
   els.ammoSelect.addEventListener("change", updateAmmoMeta);
+  
+  els.loadItemsBtn.addEventListener("click", loadItemsCached);
+  els.weaponSelect.addEventListener("change", updateBuildMeta);
+  els.barrelSelect.addEventListener("change", updateBuildMeta);
+  els.muzzleSelect.addEventListener("change", updateBuildMeta);
+  els.opticSelect.addEventListener("change", updateBuildMeta);
+  els.mountSelect.addEventListener("change", updateBuildMeta);
+  els.sightOverride.addEventListener("change", () => {
+    els.sightManualCm.disabled = !els.sightOverride.checked;
+    updateBuildSummary();
+  });
+
   els.calcBtn.addEventListener("click", calc);
 
   // Small UX: if user changes model, show/hide drag input
@@ -451,8 +954,17 @@
   els.model.addEventListener("change", toggleDrag);
   toggleDrag();
 
-  // preload empty select
-  buildSelect([]);
+  // preload empty selects
+  buildSelect([], els.weaponSelect);
+  buildSelect([], els.barrelSelect);
+  buildSelect([], els.muzzleSelect);
+  buildSelect([], els.opticSelect);
+  buildSelect([], els.mountSelect);
+  buildSelectAmmo([]);
+
+  // auto-load ammo and items on page load
+  loadAmmoCached();
+  loadItemsCached();
 })();
 </script>
 </body>
